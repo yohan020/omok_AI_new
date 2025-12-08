@@ -1,0 +1,212 @@
+# 파일명: train_mcts.py
+
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+from collections import deque
+import numpy as np
+from tqdm import tqdm
+import os
+import random
+
+from model import ResNetActorCritic
+from environment import OmokEnv
+from mcts import run_mcts
+
+# --- 1. 훈련 설정 (8x8 버전) ---
+BOARD_SIZE = 8              # (!!!) 8x8로 축소
+BATCH_SIZE = 128
+REPLAY_BUFFER_SIZE = 30000
+EPISODES_PER_CYCLE = 20
+TRAIN_EPOCHS_PER_CYCLE = 10
+MCTS_SIMULATIONS = 400      # 8x8에서는 400이면 매우 깊은 수읽기입니다.
+C_PUCT = 1.0
+MODEL_SAVE_DIR = 'models_8x8' # (!!!) 저장 폴더 변경
+
+# --- 2. 리셋 설정 ---
+RESUME_FROM_CYCLE = 0       # (!!!) 처음부터 시작
+FINAL_CYCLE_GOAL = 1000
+
+INITIAL_LEARNING_RATE = 0.001 # (!!!) 초기 학습률로 복귀
+NEW_SCHEDULER_STEP = 100      # 100 사이클마다 감소
+# -----------------------------
+
+def get_symmetries(state, pi):
+    aug_data = []
+    pi_board = np.reshape(pi, (BOARD_SIZE, BOARD_SIZE))
+    for i in range(4):
+        state_rot = np.rot90(state, k=i, axes=(1, 2))
+        pi_rot = np.rot90(pi_board, k=i)
+        aug_data.append((np.ascontiguousarray(state_rot), np.ascontiguousarray(pi_rot.flatten())))
+        state_flip = np.flip(state_rot, axis=2)
+        pi_flip = np.fliplr(pi_rot)
+        aug_data.append((np.ascontiguousarray(state_flip), np.ascontiguousarray(pi_flip.flatten())))
+    return aug_data
+
+# train_mcts.py 의 self_play 함수 (8x8 가상 울타리 버전)
+
+def self_play(model, device):
+    replay_data = []
+    env = OmokEnv(board_size=BOARD_SIZE)
+    state = env.reset()
+    game_history = []
+    
+    move_count = 0
+
+    # (!!!) 8x8 보드용 가상 울타리 설정
+    # 초반 6수(흑3, 백3)까지는 무조건 중앙 4x4 영역(인덱스 2~5) 안에만 둬야 함
+    RESTRICT_MOVES_UNTIL = 6
+    MIN_IDX, MAX_IDX = 2, 6  # 2, 3, 4, 5 (4칸)
+
+    while True:
+        # MCTS 실행 (노이즈 포함)
+        best_action, pi_target = run_mcts(env, model, device,
+                                          num_simulations=MCTS_SIMULATIONS,
+                                          c_puct=C_PUCT,
+                                          add_noise=True)
+
+        if best_action == -1: break
+        
+        # (!!!) 가상 울타리 강제 로직
+        if move_count < RESTRICT_MOVES_UNTIL:
+            row, col = divmod(best_action, BOARD_SIZE)
+            
+            # AI가 중앙 울타리 밖(구석/변두리)에 두려고 하면?
+            if not (MIN_IDX <= row < MAX_IDX and MIN_IDX <= col < MAX_IDX):
+                # 강제로 중앙 빈칸 중 하나를 랜덤으로 선택 (교정)
+                center_candidates = []
+                for r in range(MIN_IDX, MAX_IDX):
+                    for c in range(MIN_IDX, MAX_IDX):
+                        if env.board[r, c] == 0:
+                            center_candidates.append(r * BOARD_SIZE + c)
+                
+                if center_candidates:
+                    # AI의 선택을 무시하고 강제로 둠
+                    best_action = random.choice(center_candidates)
+                    # 정책 타겟도 수정 (이 수만 100% 정답 처리)
+                    pi_target = np.zeros(BOARD_SIZE * BOARD_SIZE)
+                    pi_target[best_action] = 1.0
+        
+        game_history.append((env.get_state(), pi_target))
+        state, reward, done = env.step(best_action)
+        move_count += 1
+        
+        if done:
+            z = reward
+            for state_hist, pi_hist in reversed(game_history):
+                symmetries = get_symmetries(state_hist, pi_hist)
+                for sym_state, sym_pi in symmetries:
+                    replay_data.append((sym_state, sym_pi, z))
+                z = -z
+            break
+            
+    return replay_data
+
+def train_network(model, optimizer, replay_buffer, device):
+    sample_size = min(len(replay_buffer), BATCH_SIZE)
+    if sample_size == 0: return 0.0, 0.0
+        
+    samples = random.sample(replay_buffer, sample_size)
+    states, pis, zs = zip(*samples)
+    
+    state_batch = torch.tensor(np.array(states), dtype=torch.float32).to(device)
+    pi_target_batch = torch.tensor(np.array(pis), dtype=torch.float32).to(device)
+    z_target_batch = torch.tensor(np.array(zs), dtype=torch.float32).unsqueeze(1).to(device)
+
+    policy_logits, value_pred = model(state_batch)
+    value_loss = F.mse_loss(value_pred, z_target_batch)
+    policy_loss = -torch.sum(pi_target_batch * F.log_softmax(policy_logits, dim=-1), dim=-1).mean()
+    total_loss = value_loss + policy_loss
+    
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+    
+    return value_loss.item(), policy_loss.item()
+
+def main():
+    if torch.cuda.is_available(): device = torch.device("cuda")
+    elif torch.backends.mps.is_available(): device = torch.device("mps")
+    else: device = torch.device("cpu")
+    print(f"Using device: {device}")
+    
+    if not os.path.exists(MODEL_SAVE_DIR):
+        os.makedirs(MODEL_SAVE_DIR)
+        print(f"'{MODEL_SAVE_DIR}' 폴더를 생성했습니다.")
+
+    model = ResNetActorCritic(board_size=BOARD_SIZE).to(device)
+    
+    start_cycle = 0
+    current_lr = INITIAL_LEARNING_RATE
+
+    # (!!!) 모델 로드 로직 수정 (새 폴더에서 찾음)
+    if RESUME_FROM_CYCLE > 0:
+        MODEL_PATH = os.path.join(MODEL_SAVE_DIR, f'resnet_omok_model_cycle_{RESUME_FROM_CYCLE}.pth')
+        try:
+            model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+            print(f"🔄 기존 훈련 모델 발견! 이어하기를 준비합니다: {MODEL_PATH}")
+            start_cycle = RESUME_FROM_CYCLE
+        except FileNotFoundError:
+            print(f"모델({MODEL_PATH})이 없어 0부터 새로 시작합니다.")
+    else:
+        print("🚀 8x8 보드에서 훈련을 처음부터 시작합니다!")
+
+    optimizer = optim.Adam(model.parameters(), lr=current_lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=NEW_SCHEDULER_STEP, gamma=0.1)
+    
+    print(f"   -> Cycle {start_cycle}부터 {FINAL_CYCLE_GOAL}까지 훈련합니다.")
+    
+    replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
+
+    for cycle in tqdm(range(start_cycle, FINAL_CYCLE_GOAL), desc="Training Progress"):
+        
+        current_lr = scheduler.get_last_lr()[0]
+        if current_lr < 1e-8:
+            print("\n" + "="*50)
+            print(f"Cycle {cycle+1}: 학습률 리셋")
+            optimizer = optim.Adam(model.parameters(), lr=INITIAL_LEARNING_RATE, weight_decay=1e-4)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=NEW_SCHEDULER_STEP, gamma=0.1)
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"   -> 새 학습률: {current_lr:.8f}")
+            print("="*50 + "\n")
+
+        print(f"\n--- Cycle {cycle + 1}/{FINAL_CYCLE_GOAL} ---")
+        
+        model.eval()
+        pbar_self_play = tqdm(range(EPISODES_PER_CYCLE), desc="Self-Playing")
+        for _ in pbar_self_play:
+            new_data = self_play(model, device)
+            replay_buffer.extend(new_data)
+        
+        model.train()
+        if len(replay_buffer) < BATCH_SIZE:
+            print("데이터가 부족하여 훈련을 건너뜁니다.")
+            scheduler.step()
+            continue
+            
+        pbar_train = tqdm(range(TRAIN_EPOCHS_PER_CYCLE), desc="Training Network")
+        total_v_loss = 0
+        total_p_loss = 0
+        for _ in pbar_train:
+            v_loss, p_loss = train_network(model, optimizer, replay_buffer, device)
+            total_v_loss += v_loss
+            total_p_loss += p_loss
+            
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+            
+        print(f"Avg Value Loss: {total_v_loss/TRAIN_EPOCHS_PER_CYCLE:.4f}, "
+              f"Avg Policy Loss: {total_p_loss/TRAIN_EPOCHS_PER_CYCLE:.4f}, "
+              f"LR: {current_lr:.8f}")
+
+        if (cycle + 1) % 10 == 0:
+            save_path = os.path.join(MODEL_SAVE_DIR, f'resnet_omok_model_cycle_{cycle+1}.pth')
+            torch.save(model.state_dict(), save_path)
+            tqdm.write(f"\nModel saved to {save_path}")
+
+    final_save_path = os.path.join(MODEL_SAVE_DIR, f'resnet_omok_model_{FINAL_CYCLE_GOAL}.pth')
+    torch.save(model.state_dict(), final_save_path)
+    print(f"Final model saved to {final_save_path}")
+
+if __name__ == '__main__':
+    main()
