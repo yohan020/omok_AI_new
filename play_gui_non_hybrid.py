@@ -14,9 +14,9 @@ from environment import OmokEnv
 from mcts import run_mcts
 
 # --- 설정 ---
-MODEL_PATH = 'models_8x8/resnet_omok_model_cycle_450.pth' # (!!!) 모델 경로 확인
+MODEL_PATH = 'models_8x8_reward/resnet_omok_model_cycle_330.pth' # (!!!) 모델 경로 확인
 BOARD_SIZE = 8
-MCTS_SIMULATIONS_PLAY = 5000 # AI 생각 깊이 (순수 AI이므로 높게 설정 권장)
+MCTS_SIMULATIONS_PLAY = 4000 # AI 생각 깊이 (순수 AI이므로 높게 설정 권장)
 CELL_SIZE = 50  # 격자 한 칸 크기 (픽셀)
 PADDING = 30    # 여백
 
@@ -147,22 +147,30 @@ class OmokGUI:
 
     def process_move(self, action):
         row, col = divmod(action, BOARD_SIZE)
+        
+        # (!!!) 방금 둔 플레이어를 미리 저장 (env.step 이후에 턴이 바뀔 수 있으므로)
+        current_mover = self.env.current_player
+        
         _, reward, done = self.env.step(action)
         self.last_move = (row, col)
         self.draw_stones()
         
         if done:
             self.game_over = True
-            if reward == 1.0:
-                winner = -self.env.current_player # 방금 둔 사람이 승자
+            
+            # (!!!) 승패 판별 로직 수정
+            # reward가 1.0이면 '방금 둔 사람(current_mover)'이 이긴 것
+            if reward >= 1.0: # (중간 보상 때문에 1.0보다 클 수도 있음)
+                winner = current_mover
                 if winner == self.human_color:
                     self.status_label.config(text="승리! 축하합니다!", fg="green")
                     messagebox.showinfo("결과", "당신이 이겼습니다!")
                 else:
                     self.status_label.config(text="패배... AI가 이겼습니다.", fg="red")
                     messagebox.showinfo("결과", "AI가 이겼습니다.")
-            elif reward == -1.0:
-                self.status_label.config(text="AI 착수 오류 (승리)", fg="green")
+            
+            elif reward == -1.0: # 착수 오류 등
+                self.status_label.config(text="오류 발생", fg="red")
             else:
                 self.status_label.config(text="무승부", fg="black")
 
@@ -171,13 +179,16 @@ class OmokGUI:
         
         start_time = time.time()
         
-        # (!!!) MCTS 수읽기만 실행 (모든 규칙 제거됨)
+        # (!!!) 수정된 부분: add_noise=False 추가
+        # 대결 모드에서는 확률적 선택(탐험)을 끄고, 가장 좋은 수(Argmax)만 선택하게 함
         action, pi_target = run_mcts(self.env, self.model, self.device,
-                                     num_simulations=MCTS_SIMULATIONS_PLAY, c_puct=1.0)
+                                     num_simulations=MCTS_SIMULATIONS_PLAY,
+                                     c_puct=1.0,
+                                     add_noise=False)
         
         end_time = time.time()
         
-        # (디버깅) MCTS가 선택한 수와 확신도, 소요 시간 출력
+        # (이하 동일)
         if action != -1:
             row, col = divmod(action, BOARD_SIZE)
             conf = pi_target[action] * 100 if pi_target is not None else 0
@@ -185,7 +196,6 @@ class OmokGUI:
         else:
             print("AI가 기권했습니다.")
             
-        # UI 업데이트는 메인 스레드에서 해야 함
         if action != -1:
             self.root.after(0, lambda: self.process_move(action))
             if not self.game_over:

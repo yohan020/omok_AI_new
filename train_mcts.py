@@ -14,24 +14,25 @@ from environment import OmokEnv
 from mcts import run_mcts
 
 # --- 1. 훈련 설정 (8x8 버전) ---
-BOARD_SIZE = 8              # (!!!) 8x8로 축소
+BOARD_SIZE = 8              # (!!!) 8x8 보드
 BATCH_SIZE = 128
 REPLAY_BUFFER_SIZE = 30000
-EPISODES_PER_CYCLE = 20
-TRAIN_EPOCHS_PER_CYCLE = 10
-MCTS_SIMULATIONS = 400      # 8x8에서는 400이면 매우 깊은 수읽기입니다.
+EPISODES_PER_CYCLE = 20     # 한 사이클당 20판 대국
+TRAIN_EPOCHS_PER_CYCLE = 10 # 한 사이클당 10회 학습
+MCTS_SIMULATIONS = 400      # 8x8에서는 충분한 깊이
 C_PUCT = 1.0
-MODEL_SAVE_DIR = 'models_8x8' # (!!!) 저장 폴더 변경
+MODEL_SAVE_DIR = 'models_8x8_reward' # 저장 경로
 
-# --- 2. 리셋 설정 ---
-RESUME_FROM_CYCLE = 0       # (!!!) 처음부터 시작
-FINAL_CYCLE_GOAL = 1000
+# --- 2. 리셋 및 이어하기 설정 ---
+RESUME_FROM_CYCLE = 0       # (!!!) 0부터 새로 시작 권장
+FINAL_CYCLE_GOAL = 1000     # 목표 사이클
 
-INITIAL_LEARNING_RATE = 0.001 # (!!!) 초기 학습률로 복귀
-NEW_SCHEDULER_STEP = 100      # 100 사이클마다 감소
+INITIAL_LEARNING_RATE = 0.001 # 초기 학습률
+NEW_SCHEDULER_STEP = 100      # 100 사이클마다 학습률 감소
 # -----------------------------
 
 def get_symmetries(state, pi):
+    """ 데이터 증강: 회전 및 대칭으로 1판을 8판처럼 만듦 """
     aug_data = []
     pi_board = np.reshape(pi, (BOARD_SIZE, BOARD_SIZE))
     for i in range(4):
@@ -43,23 +44,21 @@ def get_symmetries(state, pi):
         aug_data.append((np.ascontiguousarray(state_flip), np.ascontiguousarray(pi_flip.flatten())))
     return aug_data
 
-# train_mcts.py 의 self_play 함수 (8x8 가상 울타리 버전)
-
 def self_play(model, device):
+    """ 자가 대국: 데이터 수집 (가상 울타리 + 중간 보상 적용) """
     replay_data = []
     env = OmokEnv(board_size=BOARD_SIZE)
     state = env.reset()
     game_history = []
     
     move_count = 0
-
-    # (!!!) 8x8 보드용 가상 울타리 설정
-    # 초반 6수(흑3, 백3)까지는 무조건 중앙 4x4 영역(인덱스 2~5) 안에만 둬야 함
+    
+    # (!!!) 가상 울타리 설정: 초반 6수는 중앙 4x4 (인덱스 2~5) 강제
     RESTRICT_MOVES_UNTIL = 6
-    MIN_IDX, MAX_IDX = 2, 6  # 2, 3, 4, 5 (4칸)
+    MIN_IDX, MAX_IDX = 2, 6
 
     while True:
-        # MCTS 실행 (노이즈 포함)
+        # MCTS 실행 (노이즈 켜기: 탐험 유도)
         best_action, pi_target = run_mcts(env, model, device,
                                           num_simulations=MCTS_SIMULATIONS,
                                           c_puct=C_PUCT,
@@ -70,10 +69,9 @@ def self_play(model, device):
         # (!!!) 가상 울타리 강제 로직
         if move_count < RESTRICT_MOVES_UNTIL:
             row, col = divmod(best_action, BOARD_SIZE)
-            
-            # AI가 중앙 울타리 밖(구석/변두리)에 두려고 하면?
+            # AI가 울타리 밖(구석)으로 나가려 하면?
             if not (MIN_IDX <= row < MAX_IDX and MIN_IDX <= col < MAX_IDX):
-                # 강제로 중앙 빈칸 중 하나를 랜덤으로 선택 (교정)
+                # 강제로 중앙 빈칸 중 하나를 랜덤 선택 (교정)
                 center_candidates = []
                 for r in range(MIN_IDX, MAX_IDX):
                     for c in range(MIN_IDX, MAX_IDX):
@@ -81,28 +79,50 @@ def self_play(model, device):
                             center_candidates.append(r * BOARD_SIZE + c)
                 
                 if center_candidates:
-                    # AI의 선택을 무시하고 강제로 둠
                     best_action = random.choice(center_candidates)
-                    # 정책 타겟도 수정 (이 수만 100% 정답 처리)
+                    # 정책 타겟도 이 수가 100% 정답인 것처럼 수정
                     pi_target = np.zeros(BOARD_SIZE * BOARD_SIZE)
                     pi_target[best_action] = 1.0
         
-        game_history.append((env.get_state(), pi_target))
-        state, reward, done = env.step(best_action)
+        # (!!!) 중간 보상 획득
+        # step 함수가 반환하는 reward에는 승패(+1/-1) 뿐만 아니라
+        # 공격 성공 보너스(+0.2, +0.5)도 포함됨 (environment.py 수정 필수)
+        next_state, immediate_reward, done = env.step(best_action)
+        
+        # 역사 저장: (상태, MCTS확률, "이번 수의 보상")
+        game_history.append([env.get_state(), pi_target, immediate_reward])
+        
+        state = next_state
         move_count += 1
         
         if done:
-            z = reward
-            for state_hist, pi_hist in reversed(game_history):
+            # 역전파: 게임 끝에서부터 거슬러 올라가며 가치(Value) 계산
+            running_value = 0.0
+            
+            for i in range(len(game_history) - 1, -1, -1):
+                state_hist, pi_hist, reward_hist = game_history[i]
+                
+                if i == len(game_history) - 1:
+                    # 마지막 수는 승패 보상 (+1.0 or -1.0 or 0)
+                    running_value = reward_hist
+                    if running_value > 1.0: running_value = 1.0 # 캡
+                else:
+                    # 중간 수는 "미래 가치(상대방 입장의 -Value)" + "즉각 보상(공격 점수)"
+                    # V(s) = Reward + V(s') * (-1)
+                    running_value = reward_hist - running_value
+                
+                # 데이터 증강 후 저장
                 symmetries = get_symmetries(state_hist, pi_hist)
                 for sym_state, sym_pi in symmetries:
-                    replay_data.append((sym_state, sym_pi, z))
-                z = -z
+                    # running_value가 신경망이 예측해야 할 목표값(z)이 됨
+                    replay_data.append((sym_state, sym_pi, running_value))
+            
             break
             
     return replay_data
 
 def train_network(model, optimizer, replay_buffer, device):
+    """ 신경망 학습 """
     sample_size = min(len(replay_buffer), BATCH_SIZE)
     if sample_size == 0: return 0.0, 0.0
         
@@ -114,8 +134,13 @@ def train_network(model, optimizer, replay_buffer, device):
     z_target_batch = torch.tensor(np.array(zs), dtype=torch.float32).unsqueeze(1).to(device)
 
     policy_logits, value_pred = model(state_batch)
+    
+    # Value Loss (MSE): 예측 가치와 실제 가치(보상 합계) 차이
     value_loss = F.mse_loss(value_pred, z_target_batch)
+    
+    # Policy Loss (Cross Entropy): 예측 확률과 MCTS 확률 차이
     policy_loss = -torch.sum(pi_target_batch * F.log_softmax(policy_logits, dim=-1), dim=-1).mean()
+    
     total_loss = value_loss + policy_loss
     
     optimizer.zero_grad()
@@ -139,7 +164,7 @@ def main():
     start_cycle = 0
     current_lr = INITIAL_LEARNING_RATE
 
-    # (!!!) 모델 로드 로직 수정 (새 폴더에서 찾음)
+    # 이어하기 로직
     if RESUME_FROM_CYCLE > 0:
         MODEL_PATH = os.path.join(MODEL_SAVE_DIR, f'resnet_omok_model_cycle_{RESUME_FROM_CYCLE}.pth')
         try:
@@ -160,6 +185,7 @@ def main():
 
     for cycle in tqdm(range(start_cycle, FINAL_CYCLE_GOAL), desc="Training Progress"):
         
+        # 자동 학습률 리셋 (0이 되면 초기화)
         current_lr = scheduler.get_last_lr()[0]
         if current_lr < 1e-8:
             print("\n" + "="*50)
@@ -172,12 +198,14 @@ def main():
 
         print(f"\n--- Cycle {cycle + 1}/{FINAL_CYCLE_GOAL} ---")
         
+        # 1. 자가 대국 (데이터 수집)
         model.eval()
         pbar_self_play = tqdm(range(EPISODES_PER_CYCLE), desc="Self-Playing")
         for _ in pbar_self_play:
             new_data = self_play(model, device)
             replay_buffer.extend(new_data)
         
+        # 2. 신경망 학습
         model.train()
         if len(replay_buffer) < BATCH_SIZE:
             print("데이터가 부족하여 훈련을 건너뜁니다.")
@@ -199,11 +227,13 @@ def main():
               f"Avg Policy Loss: {total_p_loss/TRAIN_EPOCHS_PER_CYCLE:.4f}, "
               f"LR: {current_lr:.8f}")
 
+        # 모델 저장 (10 사이클마다)
         if (cycle + 1) % 10 == 0:
             save_path = os.path.join(MODEL_SAVE_DIR, f'resnet_omok_model_cycle_{cycle+1}.pth')
             torch.save(model.state_dict(), save_path)
             tqdm.write(f"\nModel saved to {save_path}")
 
+    # 최종 저장
     final_save_path = os.path.join(MODEL_SAVE_DIR, f'resnet_omok_model_{FINAL_CYCLE_GOAL}.pth')
     torch.save(model.state_dict(), final_save_path)
     print(f"Final model saved to {final_save_path}")

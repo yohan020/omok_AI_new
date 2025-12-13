@@ -6,88 +6,116 @@ class OmokEnv:
     def __init__(self, board_size=15):
         self.board_size = board_size
         self.board = np.zeros((board_size, board_size), dtype=int)
-        self.current_player = 1 # 1: 흑, -1: 백
+        self.current_player = 1  # 1: 흑, -1: 백
+        self.winner = 0
 
     def reset(self):
-        """ 보드를 리셋하고 초기 상태를 반환합니다. """
         self.board = np.zeros((self.board_size, self.board_size), dtype=int)
         self.current_player = 1
+        self.winner = 0
         return self.get_state()
 
-    def get_valid_moves(self):
-        """ 둘 수 있는 위치(빈 칸)를 1D 마스크로 반환 (True/False) """
-        return (self.board == 0).flatten()
-
     def get_state(self):
-        """ 모델 입력을 위한 2채널 상태 반환 (현재 플레이어, 상대방) """
         state = np.zeros((2, self.board_size, self.board_size), dtype=np.float32)
-        state[0] = (self.board == self.current_player).astype(np.float32)
-        state[1] = (self.board == -self.current_player).astype(np.float32)
+        if self.current_player == 1:
+            state[0] = (self.board == 1).astype(np.float32)
+            state[1] = (self.board == -1).astype(np.float32)
+        else:
+            state[0] = (self.board == -1).astype(np.float32)
+            state[1] = (self.board == 1).astype(np.float32)
         return state
 
-    def check_win(self, r, c, player):
-        """ (r, c)에 놓인 돌을 기준으로 5목을 확인합니다. """
-        directions = [(0, 1), (1, 0), (1, 1), (1, -1)] # 가로, 세로, 대각선, 역대각선
+    def get_valid_moves(self):
+        return (self.board.flatten() == 0).astype(int)
+
+    def check_win(self, row, col, player):
+        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
         for dr, dc in directions:
             count = 1
-            # 한 방향
             for i in range(1, 5):
-                nr, nc = r + dr * i, c + dc * i
-                if 0 <= nr < self.board_size and 0 <= nc < self.board_size and self.board[nr, nc] == player:
+                r, c = row + dr * i, col + dc * i
+                if 0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == player:
                     count += 1
-                else:
-                    break
-            # 반대 방향
+                else: break
             for i in range(1, 5):
-                nr, nc = r - dr * i, c - dc * i
-                if 0 <= nr < self.board_size and 0 <= nc < self.board_size and self.board[nr, nc] == player:
+                r, c = row - dr * i, col - dc * i
+                if 0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == player:
                     count += 1
-                else:
-                    break
-            if count >= 5:
-                return True
+                else: break
+            if count >= 5: return True
         return False
 
-    # (!!!) MCTS 시뮬레이션을 위해 추가된 메서드
+    # (!!!) 추가된 기능: 공격적인 패턴(열린3, 열린4) 감지
+    def check_attack_pattern(self, row, col, player):
+        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+        bonus_reward = 0.0
+        
+        # 4목: 거의 승리와 같으므로 높은 점수
+        # 3목: 좋은 공격 찬스이므로 중간 점수
+        
+        for dr, dc in directions:
+            count = 1
+            # 양쪽이 막혔는지 확인 (0: 안 막힘, 1: 막힘/벽)
+            blocked_sides = 0
+            
+            # 정방향 탐색
+            r, c = row + dr, col + dc
+            while 0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == player:
+                count += 1
+                r, c = r + dr, c + dc
+            if not (0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == 0):
+                blocked_sides += 1
+
+            # 역방향 탐색
+            r, c = row - dr, col - dc
+            while 0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == player:
+                count += 1
+                r, c = r - dr, c - dc
+            if not (0 <= r < self.board_size and 0 <= c < self.board_size and self.board[r, c] == 0):
+                blocked_sides += 1
+            
+            # (1) 열린 4 (양쪽 뚫림 or 한쪽 뚫림) -> 다음 턴에 5가 될 수 있음
+            if count == 4:
+                if blocked_sides < 2: # 완전히 막힌 게 아니면
+                    return 0.5 # 아주 큰 보상! (0.5승)
+
+            # (2) 열린 3 (양쪽 다 뚫려야만 진짜 3)
+            if count == 3:
+                if blocked_sides == 0: # 양쪽 다 뚫려 있어야 함
+                    return 0.2 # 기분 좋은 보상
+
+        return 0.0
+
+    def step(self, action):
+        row = action // self.board_size
+        col = action % self.board_size
+        
+        if self.board[row, col] != 0:
+            return self.get_state(), -1, True # 잘못된 수
+
+        self.board[row, col] = self.current_player
+
+        # 1. 승리 체크
+        if self.check_win(row, col, self.current_player):
+            self.winner = self.current_player
+            return self.get_state(), 1.0, True
+        
+        # 2. 무승부 체크
+        if np.all(self.board != 0):
+            return self.get_state(), 0, True
+        
+        # (!!!) 3. 중간 보상 체크 (승패가 안 났을 때)
+        # 공격적인 수를 두면 보너스 점수 부여
+        bonus = self.check_attack_pattern(row, col, self.current_player)
+        
+        self.current_player *= -1
+        
+        # 게임은 안 끝났지만(False), 보너스 점수를 반환
+        return self.get_state(), bonus, False
+
     def copy(self):
-        """ MCTS 시뮬레이션을 위한 환경 복사본 생성 """
         new_env = OmokEnv(self.board_size)
         new_env.board = np.copy(self.board)
         new_env.current_player = self.current_player
+        new_env.winner = self.winner
         return new_env
-
-    # (!!!) MCTS 호환을 위해 수정된 step 메서드
-    def step(self, action):
-        """
-        MCTS 호환 step 함수.
-        보상은 "방금 수를 둔 플레이어" 기준입니다.
-        (승리: 1.0, 패배: -1.0, 무승부: 0.0, 진행: 0.0)
-        """
-        row, col = divmod(action, self.board_size)
-
-        # 1. 유효하지 않은 수(이미 돌이 있음)
-        if self.board[row, col] != 0:
-            reward = -1.0 # 잘못된 수를 둔 현재 플레이어의 즉각 패배
-            done = True
-            # 턴을 넘기지 않아야 현재 플레이어가 패배자가 됨
-            return self.get_state(), reward, done
-
-        # 2. 돌을 놓음
-        self.board[row, col] = self.current_player
-
-        # 3. 방금 둔 수로 승리
-        if self.check_win(row, col, self.current_player):
-            reward = 1.0 # 현재 플레이어 승리
-            done = True
-        # 4. 무승부
-        elif np.all(self.board != 0):
-            reward = 0.0 # 무승부
-            done = True
-        # 5. 게임 계속
-        else:
-            reward = 0.0 # 진행 중
-            done = False
-
-        self.current_player *= -1 # 턴 넘김
-        
-        return self.get_state(), reward, done
