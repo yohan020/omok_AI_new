@@ -18,10 +18,10 @@ MCTS_SIMULATIONS = 4000  # AI 수읽기 횟수 (높을수록 진지함)
 DELAY_BETWEEN_MOVES = 500 # 착수 간 딜레이 (ms) - 너무 빠르면 안 보이니까
 
 # 흑돌(Black, 선공) 모델
-MODEL_A_PATH = 'models_8x8_reward/resnet_omok_model_cycle_380.pth'
+MODEL_A_PATH = 'models_8x8_reward/resnet_omok_model_cycle_580.pth'
 
 # 백돌(White, 후공) 모델 - (예: 과거 버전 or 동일 버전)
-MODEL_B_PATH = 'models_8x8/resnet_omok_model_cycle_1000.pth'
+MODEL_B_PATH = 'models_8x8_reward/resnet_omok_model_cycle_580.pth'
 
 # -------------------------------------
 

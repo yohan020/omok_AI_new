@@ -14,7 +14,7 @@ from environment import OmokEnv
 from mcts import run_mcts
 
 # --- 설정 ---
-MODEL_PATH = 'models_8x8_reward/resnet_omok_model_cycle_330.pth' # (!!!) 모델 경로 확인
+MODEL_PATH = 'models_8x8_reward/resnet_omok_model_cycle_560.pth' # (!!!) 모델 경로 확인
 BOARD_SIZE = 8
 MCTS_SIMULATIONS_PLAY = 4000 # AI 생각 깊이 (순수 AI이므로 높게 설정 권장)
 CELL_SIZE = 50  # 격자 한 칸 크기 (픽셀)
